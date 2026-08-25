@@ -1,15 +1,11 @@
 // SPDX-FileCopyrightText: 2023-2026 Sayantan Santra <sayantan.santra689@gmail.com>
 // SPDX-License-Identifier: MIT
 
-use std::rc::Rc;
-
-use actix_session::Session;
-use actix_web::{
-    HttpResponse, post,
-    web::{self},
-};
 use argon2::{Argon2, PasswordVerifier, password_hash::PasswordHash};
 use log::{debug, info, warn};
+use rocket::State;
+use rocket::http::{ContentType, CookieJar, Status};
+use rocket::post;
 
 use crate::{
     AppState,
@@ -25,24 +21,26 @@ use crate::{
 };
 
 const SERVER_ERROR_RES: &str = "Something went wrong when adding the link.";
+
 // Add new links
-#[post("/api/new")]
-pub(crate) async fn add_links(req: String, auth: Auth, data: web::Data<AppState>) -> HttpResponse {
+#[post("/api/new", data = "<req>")]
+pub(crate) async fn add_links(
+    req: String,
+    auth: Auth,
+    data: &State<AppState>,
+) -> (Status, (ContentType, String)) {
     let config = &data.config;
     let cookie_response = async |public_mode| {
         let result =
             utils::add_links_helper(&req, &mut *data.writer.lock().await, config, public_mode)
                 .and_then(|(v, _)| v.into_iter().next().unwrap_or(Err(ServerError)));
         match result {
-            Ok((shorturl, _)) => HttpResponse::Created()
-                .content_type("text/plain")
-                .body(shorturl),
-            Err(ClientError { reason }) => HttpResponse::Conflict()
-                .content_type("text/plain")
-                .body(reason),
-            Err(ServerError) => HttpResponse::InternalServerError()
-                .content_type("text/plain")
-                .body(SERVER_ERROR_RES.to_owned()),
+            Ok((shorturl, _)) => (Status::Created, (ContentType::Plain, shorturl)),
+            Err(ClientError { reason }) => (Status::Conflict, (ContentType::Plain, reason)),
+            Err(ServerError) => (
+                Status::InternalServerError,
+                (ContentType::Plain, SERVER_ERROR_RES.to_owned()),
+            ),
         }
     };
     match auth {
@@ -63,7 +61,7 @@ pub(crate) async fn add_links(req: String, auth: Auth, data: web::Data<AppState>
                     };
 
                     (
-                        actix_web::http::StatusCode::OK,
+                        Status::Ok,
                         AddLinkResponse::Success(CreatedURL {
                             success: true,
                             error: false,
@@ -73,7 +71,7 @@ pub(crate) async fn add_links(req: String, auth: Auth, data: web::Data<AppState>
                     )
                 }
                 Err(ClientError { reason }) => (
-                    actix_web::http::StatusCode::BAD_REQUEST,
+                    Status::BadRequest,
                     AddLinkResponse::Error(JSONResponse {
                         success: false,
                         error: true,
@@ -81,7 +79,7 @@ pub(crate) async fn add_links(req: String, auth: Auth, data: web::Data<AppState>
                     }),
                 ),
                 Err(ServerError) => (
-                    actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    Status::InternalServerError,
                     AddLinkResponse::Error(JSONResponse {
                         success: false,
                         error: true,
@@ -99,89 +97,140 @@ pub(crate) async fn add_links(req: String, auth: Auth, data: web::Data<AppState>
                                 .next()
                                 .expect("There should be one response here."),
                         );
-                        HttpResponse::build(status).json(response)
+                        let body = serde_json::to_string(&response).unwrap_or_default();
+                        (status, (ContentType::JSON, body))
                     } else {
-                        let response: Rc<_> =
+                        let response: Vec<_> =
                             reply.into_iter().map(to_response).map(|(_, r)| r).collect();
-                        HttpResponse::Ok().json(response)
+                        let body = serde_json::to_string(&response).unwrap_or_default();
+                        (Status::Ok, (ContentType::JSON, body))
                     }
                 }
                 Err(error) => {
                     let (status, response) = to_response(Err(error));
-                    HttpResponse::build(status).json(response)
+                    let body = serde_json::to_string(&response).unwrap_or_default();
+                    (status, (ContentType::JSON, body))
                 }
             }
         }
-        Auth::InvalidAPIKey { result } => HttpResponse::Unauthorized().json(result),
+        Auth::InvalidAPIKey { result } => (
+            Status::Unauthorized,
+            (
+                ContentType::JSON,
+                serde_json::to_string(&result).unwrap_or_default(),
+            ),
+        ),
         // If password authentication or public mode is used - keeps backwards compatibility
         Auth::ValidSession => cookie_response(false).await,
         Auth::None { result: _ } => {
             if data.config.public_mode {
                 cookie_response(true).await
             } else {
-                HttpResponse::Unauthorized()
-                    .content_type("text/plain")
-                    .body("Not logged in!")
+                (
+                    Status::Unauthorized,
+                    (ContentType::Plain, "Not logged in!".to_owned()),
+                )
             }
         }
     }
 }
 
 // Get information about a single shortlink
-#[post("/api/expand")]
-pub(crate) async fn expand(req: String, auth: Auth, data: web::Data<AppState>) -> HttpResponse {
+#[post("/api/expand", data = "<req>")]
+pub(crate) async fn expand(
+    req: String,
+    auth: Auth,
+    data: &State<AppState>,
+) -> (Status, (ContentType, String)) {
     match auth {
-        Auth::ValidAPIKey => match database::find_url(&req, &data.reader) {
-            Ok(chunks) => {
-                let body = LinkInfo {
-                    success: true,
-                    error: false,
-                    longurl: chunks.longlink,
-                    hits: chunks.hits,
-                    expiry_time: chunks.expiry_time,
-                    notes: chunks.notes,
-                };
-                HttpResponse::Ok().json(body)
+        Auth::ValidAPIKey => {
+            let result = database::find_url(&req, &*data.reader.lock().await);
+            match result {
+                Ok(chunks) => {
+                    let body = LinkInfo {
+                        success: true,
+                        error: false,
+                        longurl: chunks.longlink,
+                        hits: chunks.hits,
+                        expiry_time: chunks.expiry_time,
+                        notes: chunks.notes,
+                    };
+                    (
+                        Status::Ok,
+                        (
+                            ContentType::JSON,
+                            serde_json::to_string(&body).unwrap_or_default(),
+                        ),
+                    )
+                }
+                Err(ServerError) => {
+                    let body = JSONResponse {
+                        success: false,
+                        error: true,
+                        reason: SERVER_ERROR_RES.to_owned(),
+                    };
+                    (
+                        Status::BadRequest,
+                        (
+                            ContentType::JSON,
+                            serde_json::to_string(&body).unwrap_or_default(),
+                        ),
+                    )
+                }
+                Err(ClientError { reason }) => {
+                    let body = JSONResponse {
+                        success: false,
+                        error: true,
+                        reason,
+                    };
+                    (
+                        Status::BadRequest,
+                        (
+                            ContentType::JSON,
+                            serde_json::to_string(&body).unwrap_or_default(),
+                        ),
+                    )
+                }
             }
-            Err(ServerError) => {
-                let body = JSONResponse {
-                    success: false,
-                    error: true,
-                    reason: SERVER_ERROR_RES.to_owned(),
-                };
-                HttpResponse::BadRequest().json(body)
-            }
-            Err(ClientError { reason }) => {
-                let body = JSONResponse {
-                    success: false,
-                    error: true,
-                    reason,
-                };
-                HttpResponse::BadRequest().json(body)
-            }
-        },
-        Auth::ValidSession => HttpResponse::Unauthorized().json(JSONResponse {
-            success: false,
-            error: true,
-            reason: "This route needs API auth.".to_owned(),
-        }),
-        Auth::None { result } | Auth::InvalidAPIKey { result } => {
-            HttpResponse::Unauthorized().json(result)
         }
+        Auth::ValidSession => {
+            let body = JSONResponse {
+                success: false,
+                error: true,
+                reason: "This route needs API auth.".to_owned(),
+            };
+            (
+                Status::Unauthorized,
+                (
+                    ContentType::JSON,
+                    serde_json::to_string(&body).unwrap_or_default(),
+                ),
+            )
+        }
+        Auth::None { result } | Auth::InvalidAPIKey { result } => (
+            Status::Unauthorized,
+            (
+                ContentType::JSON,
+                serde_json::to_string(&result).unwrap_or_default(),
+            ),
+        ),
     }
 }
 
 // Handle login
-#[post("/api/login")]
+#[post("/api/login", data = "<req>")]
 pub(crate) async fn login(
     auth: Auth,
     req: String,
-    session: Session,
-    data: web::Data<AppState>,
-) -> HttpResponse {
+    cookies: &CookieJar<'_>,
+    data: &State<AppState>,
+) -> (Status, (ContentType, String)) {
     let config = &data.config;
     if matches!(auth, Auth::ValidSession) {
-        return HttpResponse::Ok().body("Already authorized.");
+        return (
+            Status::Ok,
+            (ContentType::Plain, "Already authorized.".to_owned()),
+        );
     }
 
     // Check if password is hashed using Argon2. More algorithms maybe added later.
@@ -215,12 +264,19 @@ pub(crate) async fn login(
                 error: true,
                 reason: "Wrong password!".to_owned(),
             };
-            return HttpResponse::Unauthorized().json(response);
+            return (
+                Status::Unauthorized,
+                (
+                    ContentType::JSON,
+                    serde_json::to_string(&response).unwrap_or_default(),
+                ),
+            );
         }
         // Return Ok if no password was set on the server side
-        session
-            .insert("chhoto-url-auth", auth::gen_token_text())
-            .expect("Error inserting auth token.");
+        cookies.add_private(rocket::http::Cookie::new(
+            "chhoto-url-auth",
+            auth::gen_token_text(),
+        ));
 
         let response = JSONResponse {
             success: true,
@@ -228,25 +284,34 @@ pub(crate) async fn login(
             reason: "Correct password!".to_owned(),
         };
         info!("Successful login.");
-        HttpResponse::Ok().json(response)
+        (
+            Status::Ok,
+            (
+                ContentType::JSON,
+                serde_json::to_string(&response).unwrap_or_default(),
+            ),
+        )
     } else {
         // Keep this function backwards compatible
         if let Some(valid_pass) = authorized
             && !valid_pass
         {
             warn!("Failed login attempt!");
-            return HttpResponse::Unauthorized()
-                .content_type("text/plain")
-                .body("Wrong password!");
+            return (
+                Status::Unauthorized,
+                (ContentType::Plain, "Wrong password!".to_owned()),
+            );
         }
         // Return Ok if no password was set on the server side
-        session
-            .insert("chhoto-url-auth", auth::gen_token_text())
-            .expect("Error inserting auth token.");
+        cookies.add_private(rocket::http::Cookie::new(
+            "chhoto-url-auth",
+            auth::gen_token_text(),
+        ));
 
         info!("Successful login.");
-        HttpResponse::Ok()
-            .content_type("text/plain")
-            .body("Correct password!")
+        (
+            Status::Ok,
+            (ContentType::Plain, "Correct password!".to_owned()),
+        )
     }
 }

@@ -3,23 +3,12 @@
 
 use std::{fmt::Display, rc::Rc};
 
-use actix_http::{Request, StatusCode};
-use actix_service::Service;
-use actix_web::{App, Error, body::to_bytes, dev::ServiceResponse, test, web::Bytes};
+use rocket::http::{Header, Status};
+use rocket::local::asynchronous::Client;
 use serde::Deserialize;
 use tempfile::TempDir;
 
 use crate::*;
-
-pub(super) trait BodyTest {
-    fn as_str(&self) -> &str;
-}
-
-impl BodyTest for Bytes {
-    fn as_str(&self) -> &str {
-        std::str::from_utf8(self).unwrap()
-    }
-}
 
 #[derive(Deserialize)]
 pub(super) struct URLData {
@@ -71,13 +60,7 @@ pub(super) fn default_config(test: &str) -> config::Config {
     }
 }
 
-pub(super) async fn create_app(
-    conf: &config::Config,
-    test: &str,
-) -> (
-    TempDir,
-    impl Service<Request, Response = ServiceResponse, Error = Error> + use<>,
-) {
+pub(super) async fn create_app(conf: &config::Config, test: &str) -> (TempDir, Client) {
     let tempdir = TempDir::new().unwrap();
     let db_file = tempdir.path().join(format!("{test}.sqlite"));
     let writer = Arc::from(Mutex::from(database::open_db(
@@ -93,103 +76,110 @@ pub(super) async fn create_app(
     let (hits_tx, hits_rx) = mpsc::channel::<(String, bool)>(1024);
     background::spawn_hits_worker(Arc::clone(&writer), hits_rx);
 
-    (
-        tempdir,
-        test::init_service(
-            App::new()
-                .app_data(web::Data::new(AppState {
-                    hits_tx,
-                    reader: database::open_db(db_file.to_str().unwrap(), false),
-                    writer,
-                    config: conf.clone(),
-                }))
-                .service(services::siteurl)
-                .service(services::version)
-                .service(services::getconfig)
-                .service(services::add_links)
-                .service(services::getall)
-                .service(services::link_handler)
-                .service(services::edit_link)
-                .service(services::delete_link)
-                .service(services::whoami)
-                .service(services::expand),
+    let app_state = AppState {
+        hits_tx,
+        reader: Mutex::new(database::open_db(db_file.to_str().unwrap(), false)),
+        writer,
+        config: conf.clone(),
+    };
+
+    let secret_key: [u8; 64] = rand::random();
+    let figment = rocket::Config::figment()
+        .merge(("secret_key", secret_key.as_slice()))
+        .merge(("cli_colors", false))
+        .merge(("log_level", rocket::config::LogLevel::Off))
+        .merge(("ident", false));
+
+    let rocket_instance = rocket::custom(figment)
+        .manage(app_state)
+        .mount(
+            "/",
+            rocket::routes![
+                services::link_handler,
+                services::edit_link,
+                services::getall,
+                services::siteurl,
+                services::version,
+                services::getconfig,
+                services::add_links,
+                services::delete_link,
+                services::login,
+                services::logout,
+                services::expand,
+                services::whoami
+            ],
         )
-        .await,
-    )
+        .register("/", rocket::catchers![services::utils::error404]);
+
+    let client = Client::tracked(rocket_instance).await.unwrap();
+
+    (tempdir, client)
 }
 
-pub(super) async fn add_link<
-    T: Service<Request, Response = ServiceResponse, Error = Error>,
-    S: Display,
->(
-    app: T,
+pub(super) async fn add_link<S: Display>(
+    app: &Client,
     api_key: &str,
     shortlink: S,
     expiry_delay: i64,
     notes: &str,
-) -> (StatusCode, URLData) {
-    let req = test::TestRequest::post().uri("/api/new")
-        .insert_header(("X-API-Key", api_key))
-        .set_payload(format!(
+) -> (Status, URLData) {
+    let resp = app
+        .post("/api/new")
+        .header(Header::new("X-API-Key", api_key.to_owned()))
+        .body(format!(
             "{{\"shortlink\":\"{shortlink}\",\"longlink\":\"https://example-{shortlink}.com\",\"expiry_delay\":{expiry_delay},\"notes\":\"{notes}\"}}"
         ))
-        .to_request();
+        .dispatch()
+        .await;
 
-    let resp = test::call_service(&app, req).await;
     let status = resp.status();
-    let body = to_bytes(resp.into_body()).await.unwrap();
-    let url: URLData = serde_json::from_str(body.as_str()).unwrap();
+    let body = resp.into_string().await.unwrap();
+    let url: URLData = serde_json::from_str(&body).unwrap();
 
     (status, url)
 }
 
-pub(super) async fn expand<
-    T: Service<Request, Response = ServiceResponse, Error = Error>,
-    S: Display,
->(
-    app: T,
+pub(super) async fn expand<S: Display>(
+    app: &Client,
     api_key: &str,
     shortlink: S,
-) -> (StatusCode, URLData) {
-    let req = test::TestRequest::post()
-        .uri("/api/expand")
-        .insert_header(("X-API-Key", api_key))
-        .set_payload(shortlink.to_string())
-        .to_request();
-    let resp = test::call_service(&app, req).await;
+) -> (Status, URLData) {
+    let resp = app
+        .post("/api/expand")
+        .header(Header::new("X-API-Key", api_key.to_owned()))
+        .body(shortlink.to_string())
+        .dispatch()
+        .await;
+
     let status = resp.status();
-    let body = to_bytes(resp.into_body()).await.unwrap();
-    let url: URLData = serde_json::from_str(body.as_str()).unwrap();
+    let body = resp.into_string().await.unwrap();
+    let url: URLData = serde_json::from_str(&body).unwrap();
 
     (status, url)
 }
 
-pub(super) async fn getall<T: Service<Request, Response = ServiceResponse, Error = Error>>(
-    app: T,
-    api_key: &str,
-    params: &str,
-) -> Rc<[URLData]> {
-    let req = test::TestRequest::get()
-        .uri(&format!("/api/all?{params}"))
-        .insert_header(("X-API-Key", api_key))
-        .to_request();
+pub(super) async fn getall(app: &Client, api_key: &str, params: &str) -> Rc<[URLData]> {
+    let resp = app
+        .get(format!("/api/all?{params}"))
+        .header(Header::new("X-API-Key", api_key.to_owned()))
+        .dispatch()
+        .await;
 
-    let resp = test::call_service(&app, req).await;
-    assert!(resp.status().is_success());
-    let body = to_bytes(resp.into_body()).await.unwrap();
-    let reply_chunks: Rc<[URLData]> = serde_json::from_str(body.as_str()).unwrap();
+    assert!(resp.status().class().is_success());
+    let body = resp.into_string().await.unwrap();
+    let reply_chunks: Rc<[URLData]> = serde_json::from_str(&body).unwrap();
 
     reply_chunks
 }
 
-pub(super) async fn edit_link<T: Service<Request, Response = ServiceResponse, Error = Error>>(
-    app: T,
+pub(super) async fn edit_link(
+    app: &Client,
     api_key: &str,
     shortlink: &str,
     reset_hits: bool,
     expiry_time: Option<i64>,
     notes: Option<&str>,
-) -> StatusCode {
+) -> Status {
     let mut payload = format!(
         "\"shortlink\":\"{shortlink}\",\"longlink\":\"https://edited-{shortlink}.com\",\"reset_hits\":{reset_hits}"
     );
@@ -199,11 +189,11 @@ pub(super) async fn edit_link<T: Service<Request, Response = ServiceResponse, Er
     if let Some(note) = notes {
         payload.push_str(&format!(",\"notes\":\"{note}\""));
     }
-    let req = test::TestRequest::put()
-        .uri("/api/edit")
-        .insert_header(("X-API-Key", api_key))
-        .set_payload(format!("{{{payload}}}"))
-        .to_request();
-    let resp = test::call_service(&app, req).await;
+    let resp = app
+        .put("/api/edit")
+        .header(Header::new("X-API-Key", api_key.to_owned()))
+        .body(format!("{{{payload}}}"))
+        .dispatch()
+        .await;
     resp.status()
 }

@@ -1,20 +1,14 @@
 // SPDX-FileCopyrightText: 2023-2026 Sayantan Santra <sayantan.santra689@gmail.com>
 // SPDX-License-Identifier: MIT
 
-use actix_files::Files;
-use actix_session::{SessionMiddleware, config::PersistentSession, storage::CookieSessionStore};
-use actix_web::{
-    App, HttpServer,
-    cookie::{self, Key},
-    middleware,
-    web::{self, Redirect},
-};
 use log::info;
+use rocket::fairing::{Fairing, Info, Kind};
+use rocket::fs::FileServer;
+use rocket::http::Header;
+use rocket::response::Redirect;
+use rocket::{Request, Response, routes};
 use rusqlite::Connection;
-use std::{
-    io::Result,
-    sync::{Arc, Once},
-};
+use std::sync::{Arc, Once};
 use tokio::sync::{Mutex, mpsc};
 
 // Import modules
@@ -33,21 +27,42 @@ mod tests;
 // This struct represents state
 struct AppState {
     hits_tx: mpsc::Sender<(String, bool)>,
-    reader: Connection,
+    reader: Mutex<Connection>,
     writer: Arc<Mutex<Connection>>,
     config: config::Config,
 }
 
 static LOGGER: Once = Once::new();
 
-#[actix_web::main]
-async fn main() -> Result<()> {
+// Fairing that adds a configurable Cache-Control header to every response.
+struct CacheControlFairing {
+    header: Option<String>,
+}
+
+#[rocket::async_trait]
+impl Fairing for CacheControlFairing {
+    fn info(&self) -> Info {
+        Info {
+            name: "Cache-Control Header",
+            kind: Kind::Response,
+        }
+    }
+
+    async fn on_response<'r>(&self, _req: &'r Request<'_>, res: &mut Response<'r>) {
+        if let Some(header) = &self.header {
+            res.set_header(Header::new("Cache-Control", header.to_owned()));
+        }
+    }
+}
+
+// Build the env_logger instance with the same custom format as before.
+fn init_logger() {
     env_logger::builder()
         .parse_filters(
             std::env::var("RUST_LOG")
                 .ok()
                 .filter(|s| !s.is_empty())
-                .unwrap_or("warn,chhoto_url=info,actix_session::middleware=error".to_owned())
+                .unwrap_or("warn,chhoto_url=info".to_owned())
                 .as_str(),
         )
         .format(|buf, record| {
@@ -68,9 +83,17 @@ async fn main() -> Result<()> {
             )
         })
         .init();
+}
 
-    // Generate session key in runtime so that restart invalidates older logins
-    let secret_key = Key::generate();
+// Redirect helper for the custom landing directory setup.
+#[rocket::get("/admin/manage")]
+fn admin_manage_redirect() -> Redirect {
+    Redirect::to("/admin/manage/")
+}
+
+#[rocket::main]
+async fn main() -> Result<(), rocket::Error> {
+    init_logger();
 
     eprintln!("----------------------------------------------------------------------");
     info!("Starting Chhoto URL Server v{}", utils::get_version());
@@ -93,71 +116,73 @@ async fn main() -> Result<()> {
 
     let port = conf.port;
     let addr = conf.listen_address.clone();
-    // Actually start the server
-    HttpServer::new(move || {
-        let mut app = App::new()
-            .wrap(middleware::Logger::default())
-            .wrap(middleware::Compress::default())
-            .wrap(middleware::NormalizePath::new(
-                middleware::TrailingSlash::MergeOnly,
-            ))
-            .wrap(
-                SessionMiddleware::builder(CookieSessionStore::default(), secret_key.clone())
-                    .cookie_same_site(actix_web::cookie::SameSite::Strict)
-                    .session_lifecycle(
-                        PersistentSession::default().session_ttl(cookie::time::Duration::days(7)),
-                    )
-                    .cookie_secure(false)
-                    .build(),
-            )
-            // Maintain a single instance of database throughout
-            .app_data(web::Data::new(AppState {
-                hits_tx: hits_tx.clone(),
-                reader: database::open_db(&conf.db_location, true),
-                writer: Arc::clone(&writer),
-                config: conf.clone(),
-            }))
-            .wrap(if let Some(header) = &conf.cache_control_header {
-                middleware::DefaultHeaders::new().add(("Cache-Control", header.to_owned()))
-            } else {
-                middleware::DefaultHeaders::new()
-            })
-            .service(services::link_handler)
-            .service(services::edit_link)
-            .service(services::getall)
-            .service(services::siteurl)
-            .service(services::version)
-            .service(services::getconfig)
-            .service(services::add_links)
-            .service(services::delete_link)
-            .service(services::login)
-            .service(services::logout)
-            .service(services::expand)
-            .service(services::whoami);
 
-        if !conf.disable_frontend {
-            if let Some(dir) = &conf.custom_landing_directory {
-                app = app
-                    .service(Redirect::new("/admin/manage", "/admin/manage/"))
-                    .service(Files::new("/admin/manage/", "./frontend/").index_file("index.html"))
-                    .service(Files::new("/", dir).index_file("index.html"));
-            } else {
-                app = app.service(Files::new("/", "./frontend/").index_file("index.html"));
-            }
-        }
+    // Generate session key in runtime so that restart invalidates older logins
+    let secret_key: [u8; 64] = rand::random();
 
-        app.default_service(actix_web::web::get().to(utils::error404))
-    })
-    // Hardcode the port the server listens to. Allows for more intuitive Docker Compose port management
-    .bind((&*addr, port))
-    .inspect(|_| {
-        LOGGER.call_once(|| {
-            info!(
-                "Server has started listening to {} on port {}.",
-                &addr, port
-            );
+    // Configure Rocket via figment: bind address/port and set the secret key
+    // used to sign the private session cookie.
+    let figment = rocket::Config::figment()
+        .merge(("address", addr.clone()))
+        .merge(("port", port))
+        .merge(("secret_key", secret_key.as_slice()))
+        .merge(("cli_colors", false))
+        .merge(("log_level", rocket::config::LogLevel::Off))
+        .merge(("ident", false));
+
+    let app_state = AppState {
+        hits_tx,
+        reader: Mutex::new(database::open_db(&conf.db_location, true)),
+        writer: Arc::clone(&writer),
+        config: conf.clone(),
+    };
+
+    let disable_frontend = conf.disable_frontend;
+    let custom_landing_directory = conf.custom_landing_directory.clone();
+    let cache_control_header = conf.cache_control_header.clone();
+
+    let mut rocket_instance = rocket::custom(figment)
+        .manage(app_state)
+        .attach(CacheControlFairing {
+            header: cache_control_header,
         })
-    })?
-    .run()
-    .await
+        .mount(
+            "/",
+            routes![
+                services::link_handler,
+                services::edit_link,
+                services::getall,
+                services::siteurl,
+                services::version,
+                services::getconfig,
+                services::add_links,
+                services::delete_link,
+                services::login,
+                services::logout,
+                services::expand,
+                services::whoami,
+            ],
+        )
+        .register("/", rocket::catchers![services::utils::error404]);
+
+    if !disable_frontend {
+        if let Some(dir) = &custom_landing_directory {
+            rocket_instance = rocket_instance
+                .mount("/", routes![admin_manage_redirect])
+                .mount("/admin/manage", FileServer::from("./frontend/"))
+                .mount("/", FileServer::from(dir));
+        } else {
+            rocket_instance = rocket_instance.mount("/", FileServer::from("./frontend/"));
+        }
+    }
+
+    LOGGER.call_once(|| {
+        info!(
+            "Server has started listening to {} on port {}.",
+            &addr, port
+        );
+    });
+
+    rocket_instance.launch().await?;
+    Ok(())
 }

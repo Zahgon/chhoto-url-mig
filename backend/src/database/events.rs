@@ -139,7 +139,7 @@ pub(crate) fn getall(
 }
 
 // Resolve site and add link to add_hit queue
-pub(crate) async fn find_and_add_hit(
+pub(crate) fn find_and_add_hit(
     shortlink: &str,
     db: &Connection,
     hits_tx: &mpsc::Sender<(String, bool)>,
@@ -149,16 +149,16 @@ pub(crate) async fn find_and_add_hit(
         error!("Error preparing SQL statement for find link.");
         return Err(());
     };
-    let Ok(long_url) = statement
-        .query_one(named_params! {":short": shortlink, ":now": now}, |row| {
-            row.get("long_url")
-        })
-    else {
+    let Ok(long_url) = statement.query_one(named_params! {":short": shortlink, ":now": now}, |row| {
+        row.get("long_url")
+    }) else {
         return Err(());
     };
 
     debug!("Accessed link: {shortlink}.");
-    if let Err(err) = hits_tx.send((shortlink.to_owned(), false)).await {
+    // try_send keeps this non-async so callers never hold the !Sync connection borrow across an
+    // await (required for Rocket's Send handler futures). The hit queue is best-effort.
+    if let Err(err) = hits_tx.try_send((shortlink.to_owned(), false)) {
         error!("Failed to enqueue hit update after access: {err}");
     }
     Ok(long_url)
@@ -276,7 +276,7 @@ pub(crate) fn add_links(
 }
 
 // Edit an existing link
-pub(crate) async fn edit_link(
+pub(crate) fn edit_link(
     shortlink: &str,
     longlink: &str,
     reset_hits: bool,
@@ -290,10 +290,7 @@ pub(crate) async fn edit_link(
         error!("Error preparing SQL statement for edit_link.");
         return Err(());
     };
-    if reset_hits && let Err(err) = hits_tx.send((shortlink.to_owned(), true)).await {
-        error!("Failed to enqueue hit update after edit: {err}");
-    }
-    statement
+    let result = statement
         .execute(named_params! {
             ":long": longlink,
             ":short": shortlink,
@@ -303,9 +300,7 @@ pub(crate) async fn edit_link(
             ":expiry": expiry_time,
         })
         .inspect_err(|err| {
-            error!(
-                "Got an error while editing link ({shortlink}, {longlink}, {reset_hits}): {err}"
-            );
+            error!("Got an error while editing link ({shortlink}, {longlink}, {reset_hits}): {err}");
         })
         .inspect(|_| {
             debug!(
@@ -313,7 +308,14 @@ pub(crate) async fn edit_link(
                 shortlink, longlink, reset_hits, expiry_time, notes
             );
         })
-        .map_err(drop)
+        .map_err(drop);
+
+    // try_send keeps this non-async so callers never hold the !Sync connection borrow across an
+    // await (required for Rocket's Send handler futures). The hit queue is best-effort.
+    if reset_hits && let Err(err) = hits_tx.try_send((shortlink.to_owned(), true)) {
+        error!("Failed to enqueue hit update after edit: {err}");
+    }
+    result
 }
 
 // Delete an existing link

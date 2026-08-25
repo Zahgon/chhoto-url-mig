@@ -1,8 +1,6 @@
 // SPDX-FileCopyrightText: 2023-2026 Sayantan Santra <sayantan.santra689@gmail.com>
 // SPDX-License-Identifier: MIT
 
-use actix_files::NamedFile;
-use actix_web::{Responder, http::StatusCode};
 use log::{debug, error};
 use nanoid::nanoid;
 use rand::{random_range, seq::IndexedRandom};
@@ -254,7 +252,7 @@ pub(super) fn add_links_helper(
 }
 
 // Make checks and then request the DB to edit an URL entry
-pub(super) async fn edit_link_helper(
+pub(super) fn edit_link_helper(
     req: &str,
     db: &Connection,
     hits_tx: &mpsc::Sender<(String, bool)>,
@@ -289,8 +287,7 @@ pub(super) async fn edit_link_helper(
         chunks.notes.filter(|s| !s.is_empty()).as_deref(),
         hits_tx,
         db,
-    )
-    .await;
+    );
     match result {
         // Zero rows returned means no updates
         Ok(0) => Err(ClientError {
@@ -397,9 +394,14 @@ fn gen_link(
 }
 
 // 404 error page
-pub(crate) async fn error404() -> impl Responder {
-    NamedFile::open_async("./frontend/static/404.html")
-        .await
-        .customize()
-        .with_status(StatusCode::NOT_FOUND)
+#[rocket::catch(404)]
+pub(crate) async fn error404()
+-> Result<rocket::fs::NamedFile, (rocket::http::Status, &'static str)> {
+    // Serve the 404 page when present; otherwise fall back to a directly-renderable
+    // (Status, body) responder. A catcher must never return a bare Status, which
+    // Rocket treats as a failed responder and escalates to a 500.
+    match rocket::fs::NamedFile::open("./frontend/static/404.html").await {
+        Ok(file) => Ok(file),
+        Err(_) => Err((rocket::http::Status::NotFound, "404 Not Found")),
+    }
 }

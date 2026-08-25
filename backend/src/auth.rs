@@ -1,13 +1,13 @@
 // SPDX-FileCopyrightText: 2023-2026 Sayantan Santra <sayantan.santra689@gmail.com>
 // SPDX-License-Identifier: MIT
 
-use actix_session::{Session, SessionExt};
-use actix_web::{Error, FromRequest, HttpRequest, dev::Payload, web};
 use argon2::{Argon2, PasswordVerifier, password_hash::PasswordHash};
 use log::{debug, warn};
 use passwords::PasswordGenerator;
-use std::future::{Ready, ready};
-use std::{rc::Rc, time::SystemTime};
+use rocket::Request;
+use rocket::request::{FromRequest, Outcome};
+use std::rc::Rc;
+use std::time::SystemTime;
 
 use crate::{
     AppState,
@@ -16,9 +16,7 @@ use crate::{
 };
 
 // Read API key from header and process it
-fn is_api_ok(req: &HttpRequest, config: &Config) -> JSONResponse {
-    let api_header = req.headers().get("X-API-Key").and_then(|h| h.to_str().ok());
-
+fn is_api_ok(api_header: Option<&str>, config: &Config) -> JSONResponse {
     // If the api_key environment variable exists
     if config.api_key.is_some() {
         // If the header exists
@@ -112,17 +110,13 @@ pub(crate) fn gen_key() -> String {
 }
 
 // Validate a session
-fn is_session_valid(session: Session, config: &Config) -> bool {
+fn is_session_valid(token: Option<&str>, config: &Config) -> bool {
     // If there's no password provided, just return true
     if config.password.is_none() {
         return true;
     }
 
-    if let Ok(token) = session.get::<String>("chhoto-url-auth") {
-        is_token_valid(token.as_deref())
-    } else {
-        false
-    }
+    is_token_valid(token)
 }
 
 // Check a token cryptographically
@@ -153,32 +147,38 @@ pub(crate) enum Auth {
     None { result: JSONResponse },
     InvalidAPIKey { result: JSONResponse },
 }
-// Extractor for authentication
-impl FromRequest for Auth {
-    type Error = Error;
-    type Future = Ready<Result<Self, Self::Error>>;
 
-    fn from_request(req: &HttpRequest, _: &mut Payload) -> Self::Future {
+// Extractor for authentication
+#[rocket::async_trait]
+impl<'r> FromRequest<'r> for Auth {
+    type Error = std::convert::Infallible;
+
+    async fn from_request(req: &'r Request<'_>) -> Outcome<Self, Self::Error> {
         let config = &req
-            .app_data::<web::Data<AppState>>()
+            .rocket()
+            .state::<AppState>()
             .expect("Appstate wasn't created yet. THIS SHOULD NEVER OCCUR!!!")
             .config;
 
         // API key auth
-        let api_result = is_api_ok(req, config);
+        let api_header = req.headers().get_one("X-API-Key");
+        let api_result = is_api_ok(api_header, config);
         if api_result.success {
-            return ready(Ok(Auth::ValidAPIKey));
+            return Outcome::Success(Auth::ValidAPIKey);
         } else if api_result.error {
-            return ready(Ok(Auth::InvalidAPIKey { result: api_result }));
+            return Outcome::Success(Auth::InvalidAPIKey { result: api_result });
         }
 
         // Session auth
-        let session = req.get_session();
-        if is_session_valid(session, config) {
-            return ready(Ok(Auth::ValidSession));
+        let token = req
+            .cookies()
+            .get_private("chhoto-url-auth")
+            .map(|cookie| cookie.value().to_owned());
+        if is_session_valid(token.as_deref(), config) {
+            return Outcome::Success(Auth::ValidSession);
         }
 
-        ready(Ok(Auth::None { result: api_result }))
+        Outcome::Success(Auth::None { result: api_result })
     }
 }
 
